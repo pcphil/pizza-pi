@@ -6,3 +6,5 @@ settings.json
 .history
 claude.md
 bin/fd.exe
+node_modules/
+sessions
