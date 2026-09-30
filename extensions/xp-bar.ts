@@ -80,6 +80,51 @@ function saveState(file: string, state: XpState): void {
   fs.writeFileSync(file, JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
+// --- XP ledger (see openspec/changes/xp-ledger-and-command/design.md) ---
+
+interface LedgerEntry {
+  ts: string;
+  source: string;
+  amount: number;
+  reason: string;
+}
+
+function xpLedgerFile(): string {
+  return path.join(os.homedir(), ".pi", "agent", "progression", "xp-ledger.jsonl");
+}
+
+/** Appends one award to the durable ledger. Never throws — a ledger write must not block an award. */
+function appendLedger(entry: LedgerEntry): void {
+  try {
+    const file = xpLedgerFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
+  } catch {
+    // Ledger is a display aid, not the source of truth — swallow and move on.
+  }
+}
+
+/** Best-effort tail read: skips a missing file and any unparseable trailing line. */
+function readRecentLedger(n = 10): LedgerEntry[] {
+  const file = xpLedgerFile();
+  if (!fs.existsSync(file)) return [];
+  try {
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter((l) => l.trim().length > 0);
+    const recent = lines.slice(-n);
+    const entries: LedgerEntry[] = [];
+    for (const line of recent) {
+      try {
+        entries.push(JSON.parse(line) as LedgerEntry);
+      } catch {
+        // Skip a corrupt/truncated line rather than failing the whole read.
+      }
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
 // Mirrors .pi/skills/quest-tracker/scripts/quest.js's path-keying so this
 // extension can read the same per-project tasks.json for the widget.
 function escapeProjectPath(absPath: string): string {
@@ -263,7 +308,7 @@ export function isResolution(prompt: string): boolean {
   return RESOLUTION_RE.test(text);
 }
 
-/** Bare affirmative answer to "is the quest resolved?". */
+/** Bare "yes"/"done"-style reply — recognized as resolving an active quest even unprompted. */
 export function isAffirmative(prompt: string): boolean {
   const text = prompt.toLowerCase().replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
   return (
@@ -273,7 +318,7 @@ export function isAffirmative(prompt: string): boolean {
 }
 
 interface CelebrationData {
-  kind: "rank-up" | "quest-done" | "quest-start" | "quest-followup" | "quest-resolved";
+  kind: "rank-up" | "quest-done" | "quest-start" | "quest-resolved";
   rank?: string;
   description?: string;
   xp: number;
@@ -285,8 +330,6 @@ function celebrationLine(data: CelebrationData): string {
       return `⚔ Sir Peppy: Well met! Thou hast risen to ${data.rank}! (${data.xp} XP total)`;
     case "quest-start":
       return `⚔ Sir Peppy: A new quest begins — "${data.description}"`;
-    case "quest-followup":
-      return `⚔ Sir Peppy: Is the quest "${data.description}" resolved, milord?`;
     case "quest-resolved":
       return `⚔ Sir Peppy: Quest resolved — "${data.description}" (+${data.xp} XP)`;
     default:
@@ -299,11 +342,10 @@ function celebrationLine(data: CelebrationData): string {
 export default function (pi: ExtensionAPI) {
   const file = xpStateFile();
   let widgetVisible = false;
+  /** The quest name shown in the status line — unset until the model titles it, or the turn ends untitled (fallback). */
   let activeQuest: string | undefined;
-  let awaitingConfirm = false;
-  /** True from quest start until the model titles it (or the turn begins without one). */
-  let titleRequested = false;
-  let titled = false;
+  /** The plain derived name for a quest that has started but has no title yet. Never shown. */
+  let pendingQuestName: string | undefined;
 
   function awardXp(amount: number): { state: XpState; rankChanged: boolean; rank: string } {
     const before = loadState(file);
@@ -322,12 +364,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   function resolveQuest(ctx: ExtensionContext): void {
-    const description = activeQuest;
+    const description = activeQuest ?? pendingQuestName;
     activeQuest = undefined;
-    titled = false;
-    titleRequested = false;
-    awaitingConfirm = false;
+    pendingQuestName = undefined;
     const { state, rankChanged, rank } = awardXp(PROMPT_QUEST_XP);
+    appendLedger({ ts: new Date().toISOString(), source: "prompt-quest", amount: PROMPT_QUEST_XP, reason: description ?? "quest" });
     updateStatus(ctx, state);
     pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-resolved", description, xp: PROMPT_QUEST_XP });
     if (rankChanged) {
@@ -351,6 +392,32 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerEntryRenderer<{ lines: string[] }>("xp-history", (entry, _options, theme) => {
+    const box = new Box(0, 0);
+    for (const line of entry.data?.lines ?? []) {
+      box.addChild(new Text(theme.fg("warning", line), 0, 0));
+    }
+    return box;
+  });
+
+  pi.registerCommand("xp", {
+    description: "Show current XP/rank plus recent award history",
+    handler: async () => {
+      const state = loadState(file);
+      const rank = rankForXp(state.totalXp);
+      const lines = [`⚔ ${rank} · ${state.totalXp} XP total`];
+      const recent = readRecentLedger(10);
+      if (recent.length === 0) {
+        lines.push("No history yet.");
+      } else {
+        for (const entry of recent.slice().reverse()) {
+          lines.push(`+${entry.amount} ${entry.source} — ${entry.reason}`);
+        }
+      }
+      pi.appendEntry<{ lines: string[] }>("xp-history", { lines });
+    },
+  });
+
   pi.registerTool({
     name: QUEST_TITLE_TOOL,
     label: "Name Quest",
@@ -361,23 +428,25 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const title = sanitizeQuestTitle(params.title);
-      if (!activeQuest || titled || !title) {
+      if (!pendingQuestName || activeQuest || !title) {
         return { content: [{ type: "text", text: "No quest to title." }], details: {} };
       }
       activeQuest = title;
-      titled = true;
+      pendingQuestName = undefined;
       updateStatus(ctx, loadState(file));
+      pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-start", description: title, xp: 0 });
       return { content: [{ type: "text", text: `Quest titled: ${title}` }], details: {} };
     },
   });
 
+  // Fires every turn while a quest is started but not yet titled — not a one-shot flag,
+  // so a turn that errors before the model reaches the tool call still asks again next turn.
   pi.on("before_agent_start", async () => {
-    if (!activeQuest || titled || !titleRequested) return;
-    titleRequested = false;
+    if (!pendingQuestName || activeQuest) return;
     return {
       message: {
         customType: "quest-title-request",
-        content: `A quest has begun for the user's task. Call the ${QUEST_TITLE_TOOL} tool once, now, with a short, fun, knightly title (max 40 chars). Then continue the task as normal.`,
+        content: `A quest has begun for the user's task: "${pendingQuestName}". Call the ${QUEST_TITLE_TOOL} tool once, now, with a short, fun, knightly title (max 40 chars) themed around that specific task — not a generic quest title. Then continue the task as normal.`,
         display: false,
       },
     };
@@ -385,35 +454,36 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", async (event, ctx) => {
     if (event.source === "extension") return { action: "continue" };
-    const wasAwaiting = awaitingConfirm;
-    awaitingConfirm = false;
 
-    if (activeQuest) {
-      if (isResolution(event.text) || (wasAwaiting && isAffirmative(event.text))) resolveQuest(ctx);
+    if (activeQuest || pendingQuestName) {
+      // No extension-driven "is it resolved?" prompt — Sir Peppy asks that himself, per
+      // AGENTS.md, when he judges the task done. This just recognizes the user's reply.
+      if (isResolution(event.text) || isAffirmative(event.text)) resolveQuest(ctx);
     } else {
       const name = deriveQuestName(event.text);
       if (name) {
-        activeQuest = name;
-        titled = false;
-        titleRequested = true;
-        updateStatus(ctx, loadState(file));
-        pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-start", description: name, xp: 0 });
+        // Held back, not shown yet: the model titles it (before_agent_start) or, failing
+        // that, agent_before_settle falls back to this name once the turn completes.
+        pendingQuestName = name;
       }
     }
     return { action: "continue" };
   });
 
-  pi.on("agent_end", async () => {
-    if (!activeQuest) return;
-    awaitingConfirm = true;
-    pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-followup", description: activeQuest, xp: 0 });
+  // Only job left here: fall back to the plain derived name if the model never titled the
+  // quest this turn. No more automatic "is the quest resolved?" — see AGENTS.md instead.
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (pendingQuestName && !activeQuest && event.outcome === "completed") {
+      activeQuest = pendingQuestName;
+      pendingQuestName = undefined;
+      updateStatus(ctx, loadState(file));
+      pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-start", description: activeQuest, xp: 0 });
+    }
   });
 
   pi.on("session_start", async (_event, ctx) => {
     activeQuest = undefined;
-    titled = false;
-    titleRequested = false;
-    awaitingConfirm = false;
+    pendingQuestName = undefined;
     const state = loadState(file);
     const { streak, earned } = advanceStreak(state.streak, todayUtcIso());
     let finalState = state;
@@ -421,6 +491,7 @@ export default function (pi: ExtensionAPI) {
       saveState(file, { ...state, streak });
       const result = awardXp(STREAK_XP);
       finalState = result.state;
+      appendLedger({ ts: new Date().toISOString(), source: "streak", amount: STREAK_XP, reason: `day ${streak.count}` });
       if (result.rankChanged) {
         pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "rank-up", rank: result.rank, xp: finalState.totalXp });
       }
@@ -431,6 +502,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_result", async (event, ctx) => {
     if (isSuccessfulGitCommit(event)) {
       const { state, rankChanged, rank } = awardXp(COMMIT_XP);
+      appendLedger({ ts: new Date().toISOString(), source: "commit", amount: COMMIT_XP, reason: "git commit" });
       updateStatus(ctx, state);
       if (rankChanged) {
         pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "rank-up", rank, xp: state.totalXp });
@@ -441,6 +513,12 @@ export default function (pi: ExtensionAPI) {
     const quest = parseQuestCompletion(event);
     if (quest) {
       const { state, rankChanged, rank } = awardXp(SIZE_XP[quest.size]);
+      appendLedger({
+        ts: new Date().toISOString(),
+        source: "quest-tracker",
+        amount: SIZE_XP[quest.size],
+        reason: quest.description,
+      });
       updateStatus(ctx, state);
       pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, {
         kind: "quest-done",
