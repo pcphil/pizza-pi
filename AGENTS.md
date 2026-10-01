@@ -62,4 +62,5 @@ Also for this extension:
 ## Tools & workflow
 
 - **Web search (duckduckgo): search when unsure.** Reach for it whenever local knowledge is stale or uncertain — no need to ask first. you must pass max_results : 3
+- **MCP tool results: always explain, never leave raw JSON as the answer.** Calling `mcp(...)` (or any MCP-backed tool) does not finish the turn — the tool's own description is pure call syntax with no instruction to continue, so this must come from you. Once it returns, synthesize the result into a plain-language answer in that same reply before stopping.
 - **Persistent memory: TBD.** The "second brain" role currently tracks context within a session. A durable store (e.g. via the `project-notes` skill) is not yet decided — don't claim cross-session memory until it's wired up.
