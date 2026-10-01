@@ -11,12 +11,12 @@ A custom template/config for the [pi coding agent](https://pi.dev) (`@earendil-w
 `extensions/sir-peppy-banner.ts` renders an ASCII banner at the start of each session.
 
 ### XP bar and ranks
-`extensions/xp-bar.ts` adds a gamified status line: `⚔ Rank ▰▰▱▱ 12/50 · 30 XP · 🔥3 · ⚑ Quest title`.
+`extensions/progression-bar.ts` adds a gamified status line: `⚔ Rank ▰▰▱▱ 12/50 · 30 XP · 🔥3 · ⚑ Quest title`.
 
 - **Global progress:** XP, rank and streak are shared across every project.
 - **XP sources:**
   - completing a quest-tracker quest: 10 / 25 / 50 XP for small / medium / large
-  - resolving a prompt quest: 15 XP
+  - resolving a prompt quest: 15 XP base + 1 per edit/write made while it was active, capped at 30 (0 if nothing changed)
   - a successful `git commit`: 3 XP
   - the first session of each day: 5 XP
 - **Ranks:** Squire → Knight-Errant → Knight → Knight-Captain → Knight-Commander → Paladin.
@@ -25,11 +25,11 @@ A custom template/config for the [pi coding agent](https://pi.dev) (`@earendil-w
 - **`/quests`:** toggles a widget listing the project's active quests.
 
 ### Prompt quests
-When you ask the agent to do something (fix, add, refactor, edit, read a file, and so on), a quest starts automatically and shows in the status line after the streak. Questions and simple Q&A do not start one.
+Fully model-driven, not prompt-text-driven — nothing in your message automatically starts or ends a quest. Sir Peppy decides both, by calling a tool.
 
-- **Fun titles:** the quest starts with a plain name derived from your prompt, then the model swaps in a playful knightly title by calling the `name_quest` tool.
-- **Confirmation:** when a turn ends with a quest active, Sir Peppy asks whether it is resolved. Reply "yes", or say something like "that's resolved" or "it works", to clear it and earn XP.
-- **Persistence:** the quest stays active across turns and follow-up prompts, and is dropped on a new session. It is held in memory only.
+- **Starting:** he calls `start_quest` himself, with a fun knightly title, whenever he judges a task substantial enough to track. Not for simple questions or small talk. If he doesn't call it, no quest exists for that turn — no automatic fallback.
+- **Resolution:** he asks, in his own words, once he judges the task genuinely done — not automatically every turn. He then calls `resolve_quest` himself once your reply confirms it (or if you say it's resolved unprompted), clearing the quest and awarding XP scaled to what actually changed. No fixed phrase to match; it's his judgment call, not a keyword.
+- **Persistence:** an active quest rides along across turns and follow-up prompts, and is dropped on a new session. It is held in memory only.
 
 ### Quest tracker skill
 `skills/quest-tracker/` manages a per-project list of size-tagged quests (small / medium / large). Quests are created and completed only when you explicitly ask. Completing one is the main XP source. Data lives in `progression/quests/`, keyed by project path, so nothing is written into your repos.

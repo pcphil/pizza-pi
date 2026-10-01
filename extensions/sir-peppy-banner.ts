@@ -24,20 +24,8 @@ const banner = [
 ]
 const GRADIENT = ["warning"] as const;
 
-class SirPeppyBanner {
-    private lines = banner[0].split("\n");
-    constructor(private theme: any) {}
-
-    render(width: number): string[] {
-        return this.lines.map((line, index) => {
-            return this.theme.fg(GRADIENT[index % GRADIENT.length], line);
-        });
-    }
-    invalidate(): void {}
-}
-
 export default function (pi: ExtensionAPI) {
-    pi.registerEntryRenderer("sir-peppy-banner", (entry, { expanded }, theme) => {
+    pi.registerEntryRenderer("sir-peppy-banner", (entry, _options, theme) => {
         const lines = banner[0].split("\n");
         const box = new Box(0, 0);
         lines.forEach((line, index) => {
@@ -46,7 +34,7 @@ export default function (pi: ExtensionAPI) {
         return box;
     });
 
-     pi.on("session_start", async (event, ctx) => {
+     pi.on("session_start", async () => {
         pi.appendEntry("sir-peppy-banner");
     });
 }

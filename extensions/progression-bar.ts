@@ -1,351 +1,71 @@
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
-import type { ExtensionAPI, ExtensionContext, ToolResultEvent } from "@earendil-works/pi-coding-agent";
-import { isBashToolResult, isPowerShellToolResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import {
+  SIZE_XP,
+  COMMIT_XP,
+  STREAK_XP,
+  QUEST_START_TOOL,
+  QUEST_RESOLVE_TOOL,
+  STATUS_KEY,
+  WIDGET_KEY,
+  CELEBRATION_TYPE,
+  type XpState,
+  xpStateFile,
+  loadState,
+  saveState,
+  appendLedger,
+  readRecentLedger,
+  activeQuestLines,
+  rankForXp,
+  xpBar,
+  todayUtcIso,
+  advanceStreak,
+  isSuccessfulGitCommit,
+  isQuestEditActivity,
+  parseQuestCompletion,
+  sanitizeQuestTitle,
+  computeQuestPayout,
+  type CelebrationData,
+  celebrationLine,
+} from "../lib/progression-bar-logic.ts";
 
-// --- Config (tunable, not architectural — see openspec/changes/add-gamification/design.md) ---
-
-export const SIZE_XP: Record<"small" | "medium" | "large", number> = {
-  small: 10,
-  medium: 25,
-  large: 50,
-};
-
-export const COMMIT_XP = 3;
-export const STREAK_XP = 5;
-export const PROMPT_QUEST_XP = 15;
-
-const QUEST_NAME_MAX = 40;
-const QUEST_TITLE_TOOL = "name_quest";
-
-export const RANKS: { threshold: number; name: string }[] = [
-  { threshold: 0, name: "Squire" },
-  { threshold: 50, name: "Knight-Errant" },
-  { threshold: 150, name: "Knight" },
-  { threshold: 350, name: "Knight-Captain" },
-  { threshold: 700, name: "Knight-Commander" },
-  { threshold: 1200, name: "Paladin" },
-];
-
-const GIT_COMMIT_RE = /\bgit\s+commit(\s|$)/;
-const QUEST_DONE_RE = /quest\.js\s+done\b/;
-const QUEST_DONE_OUTPUT_RE = /Quest #(\d+) marked done \[(small|medium|large)\]: (.+)/i;
-
-const STATUS_KEY = "xp-bar";
-const WIDGET_KEY = "xp-bar-quests";
-const CELEBRATION_TYPE = "xp-celebration";
-
-// --- State ---
-
-export interface StreakState {
-  count: number;
-  /** Last calendar day (UTC, "YYYY-MM-DD") a streak increment was recorded. */
-  lastDate?: string;
-}
-
-export interface XpState {
-  totalXp: number;
-  streak: StreakState;
-}
-
-function defaultState(): XpState {
-  return { totalXp: 0, streak: { count: 0 } };
-}
-
-function xpStateFile(): string {
-  return path.join(os.homedir(), ".pi", "agent", "progression", "xp-state.json");
-}
-
-function loadState(file: string): XpState {
-  if (!fs.existsSync(file)) return defaultState();
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    return {
-      totalXp: typeof parsed.totalXp === "number" ? parsed.totalXp : 0,
-      streak: {
-        count: typeof parsed.streak?.count === "number" ? parsed.streak.count : 0,
-        lastDate: typeof parsed.streak?.lastDate === "string" ? parsed.streak.lastDate : undefined,
-      },
-    };
-  } catch {
-    return defaultState();
-  }
-}
-
-function saveState(file: string, state: XpState): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(state, null, 2) + "\n", "utf8");
-}
-
-// --- XP ledger (see openspec/changes/xp-ledger-and-command/design.md) ---
-
-interface LedgerEntry {
-  ts: string;
-  source: string;
-  amount: number;
-  reason: string;
-}
-
-function xpLedgerFile(): string {
-  return path.join(os.homedir(), ".pi", "agent", "progression", "xp-ledger.jsonl");
-}
-
-/** Appends one award to the durable ledger. Never throws — a ledger write must not block an award. */
-function appendLedger(entry: LedgerEntry): void {
-  try {
-    const file = xpLedgerFile();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
-  } catch {
-    // Ledger is a display aid, not the source of truth — swallow and move on.
-  }
-}
-
-/** Best-effort tail read: skips a missing file and any unparseable trailing line. */
-function readRecentLedger(n = 10): LedgerEntry[] {
-  const file = xpLedgerFile();
-  if (!fs.existsSync(file)) return [];
-  try {
-    const lines = fs.readFileSync(file, "utf8").split("\n").filter((l) => l.trim().length > 0);
-    const recent = lines.slice(-n);
-    const entries: LedgerEntry[] = [];
-    for (const line of recent) {
-      try {
-        entries.push(JSON.parse(line) as LedgerEntry);
-      } catch {
-        // Skip a corrupt/truncated line rather than failing the whole read.
-      }
-    }
-    return entries;
-  } catch {
-    return [];
-  }
-}
-
-// Mirrors .pi/skills/quest-tracker/scripts/quest.js's path-keying so this
-// extension can read the same per-project tasks.json for the widget.
-function escapeProjectPath(absPath: string): string {
-  return "--" + absPath.replace(/[:\\/]/g, "-") + "--";
-}
-
-function questsFileFor(projectDir: string): string {
-  const root = path.join(os.homedir(), ".pi", "agent", "progression", "quests");
-  return path.join(root, escapeProjectPath(path.resolve(projectDir)), "tasks.json");
-}
-
-interface QuestRecord {
-  id: number;
-  description: string;
-  size: "small" | "medium" | "large";
-  status: "active" | "done";
-}
-
-function activeQuestLines(projectDir: string): string[] {
-  const file = questsFileFor(projectDir);
-  if (!fs.existsSync(file)) return ["No quests yet — ask to add one."];
-  try {
-    const store = JSON.parse(fs.readFileSync(file, "utf8")) as { quests?: QuestRecord[] };
-    const active = (store.quests ?? []).filter((q) => q.status === "active");
-    if (active.length === 0) return ["No active quests."];
-    return active.map((q) => `[ ] #${q.id} (${q.size}) ${q.description}`);
-  } catch {
-    return ["Could not read the quest list."];
-  }
-}
-
-// --- Pure logic (kept separate from I/O and the ExtensionAPI wiring for testability) ---
-
-export function rankForXp(totalXp: number): string {
-  let name = RANKS[0].name;
-  for (const rank of RANKS) {
-    if (totalXp >= rank.threshold) name = rank.name;
-  }
-  return name;
-}
-
-/** Progress toward the next rank as a bar plus "have/need" counts; full bar at max rank. */
-export function xpBar(totalXp: number, width = 10): string {
-  let idx = 0;
-  RANKS.forEach((r, i) => {
-    if (totalXp >= r.threshold) idx = i;
-  });
-  const next = RANKS[idx + 1];
-  if (!next) return `${"▰".repeat(width)} MAX`;
-  const base = RANKS[idx].threshold;
-  const span = next.threshold - base;
-  const done = totalXp - base;
-  const filled = Math.min(width, Math.floor((done / span) * width));
-  return `${"▰".repeat(filled)}${"▱".repeat(width - filled)} ${done}/${span}`;
-}
-
-function todayUtcIso(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function yesterdayIso(todayIso: string): string {
-  const d = new Date(`${todayIso}T00:00:00.000Z`);
-  d.setUTCDate(d.getUTCDate() - 1);
-  return d.toISOString().slice(0, 10);
-}
-
-/** Once-per-calendar-day streak advance. Returns the new streak and whether this call earned streak XP. */
-export function advanceStreak(streak: StreakState, todayIso: string): { streak: StreakState; earned: boolean } {
-  if (streak.lastDate === todayIso) {
-    return { streak, earned: false };
-  }
-  const continuing = streak.lastDate === yesterdayIso(todayIso);
-  const count = continuing ? streak.count + 1 : 1;
-  return { streak: { count, lastDate: todayIso }, earned: true };
-}
-
-export function isShellSuccess(event: ToolResultEvent): boolean {
-  return (isBashToolResult(event) || isPowerShellToolResult(event)) && !event.isError;
-}
-
-export function isSuccessfulGitCommit(event: ToolResultEvent): boolean {
-  if (!isShellSuccess(event)) return false;
-  const command = event.input.command;
-  return typeof command === "string" && GIT_COMMIT_RE.test(command);
-}
-
-export interface QuestCompletion {
-  id: number;
-  size: "small" | "medium" | "large";
-  description: string;
-}
-
-/** Parses a genuine (not already-done) `quest.js done` success into the quest it completed. */
-export function parseQuestCompletion(event: ToolResultEvent): QuestCompletion | undefined {
-  if (!isShellSuccess(event)) return undefined;
-  const command = event.input.command;
-  if (typeof command !== "string" || !QUEST_DONE_RE.test(command)) return undefined;
-
-  const text = event.content
-    .filter((c): c is { type: "text"; text: string } => c.type === "text")
-    .map((c) => c.text)
-    .join("\n");
-  const match = QUEST_DONE_OUTPUT_RE.exec(text);
-  if (!match) return undefined;
-  return {
-    id: Number(match[1]),
-    size: match[2].toLowerCase() as "small" | "medium" | "large",
-    description: match[3].trim(),
-  };
-}
-
-// --- Prompt-triggered quests (ephemeral; see openspec/changes/dynamic-quest-on-prompt/design.md) ---
-
-const FILLER_RE = /^(?:(?:please|pls|kindly|can you|could you|would you|will you|let['’]?s|i want you to|i need you to|go ahead and|now|also|then)\b[\s,]*)+/i;
-
-const ACTION_VERBS = new Set([
-  "add", "build", "create", "write", "implement", "fix", "refactor", "rename", "remove", "delete",
-  "update", "change", "move", "migrate", "install", "configure", "set", "run", "test", "debug",
-  "deploy", "generate", "optimize", "optimise", "replace", "integrate", "make", "modify", "extract",
-  "split", "merge", "convert", "improve", "clean", "wire", "hook", "scaffold", "patch", "upgrade",
-  "revert", "rewrite", "simplify", "enable", "disable", "apply", "commit", "push", "publish",
-  // file operations, including read-only ones: an imperative "read X" is a task, "what is in X?" is not
-  "edit", "read", "open", "view", "inspect", "review", "check", "look", "find", "search", "list",
-  "copy", "save", "insert", "append", "overwrite", "scan", "cat", "grep",
-]);
-
-function stripFiller(prompt: string): string {
-  return prompt.trim().replace(FILLER_RE, "").trim();
-}
-
-function firstWord(text: string): string {
-  return (/^[a-z']+/i.exec(text)?.[0] ?? "").toLowerCase();
-}
-
-function wordCount(text: string): number {
-  return text.split(/\s+/).filter(Boolean).length;
-}
-
-/** True for imperative requests to act (fix, add, refactor...), false for questions, commands and chatter. */
-export function isTaskPrompt(prompt: string): boolean {
-  const text = prompt.trim();
-  if (text.startsWith("/") || text.startsWith("!")) return false;
-  const body = stripFiller(text);
-  if (wordCount(body) < 3) return false;
-  return ACTION_VERBS.has(firstWord(body));
-}
-
-/** Cleans a model-supplied quest title: single line, no wrapping quotes, bounded length. */
-export function sanitizeQuestTitle(raw: string): string | undefined {
-  let title = raw.split(/\r?\n/)[0].replace(/\s+/g, " ").trim().replace(/^["'`“”]+|["'`“”]+$/g, "").trim();
-  if (!title) return undefined;
-  if (title.length > QUEST_NAME_MAX) {
-    const cut = title.slice(0, QUEST_NAME_MAX - 1);
-    const lastSpace = cut.lastIndexOf(" ");
-    title = `${(lastSpace > 10 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
-  }
-  return title;
-}
-
-/** Dynamic quest name from a task prompt; undefined when the prompt is not a task. */
-export function deriveQuestName(prompt: string): string | undefined {
-  if (!isTaskPrompt(prompt)) return undefined;
-  const line = prompt.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "";
-  let name = stripFiller(line).replace(/\s+/g, " ").replace(/[?.!]+$/, "").trim();
-  if (!name) return undefined;
-  name = name.charAt(0).toUpperCase() + name.slice(1);
-  if (name.length <= QUEST_NAME_MAX) return name;
-  const cut = name.slice(0, QUEST_NAME_MAX);
-  const lastSpace = cut.lastIndexOf(" ");
-  return `${(lastSpace > 10 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
-}
-
-const RESOLUTION_RE =
-  /\b(resolved|solved|fixed|all done|we['’]?re done|i['’]?m done|task complete|it works|works now|works great|all good|that['’]?s (?:it|all|fixed))\b/i;
-
-/** Short, non-question, non-task statement that the task is finished. */
-export function isResolution(prompt: string): boolean {
-  const text = prompt.trim();
-  if (text.includes("?") || wordCount(text) > 12) return false;
-  if (isTaskPrompt(text)) return false;
-  return RESOLUTION_RE.test(text);
-}
-
-/** Bare "yes"/"done"-style reply — recognized as resolving an active quest even unprompted. */
-export function isAffirmative(prompt: string): boolean {
-  const text = prompt.toLowerCase().replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
-  return (
-    /^(yes|yep|yeah|yup|y|sure|correct)( it is| it s| thanks| thank you)?$/.test(text) ||
-    /^(solved|resolved|done|fixed)( thanks| thank you)?$/.test(text)
-  );
-}
-
-interface CelebrationData {
-  kind: "rank-up" | "quest-done" | "quest-start" | "quest-resolved";
-  rank?: string;
-  description?: string;
-  xp: number;
-}
-
-function celebrationLine(data: CelebrationData): string {
-  switch (data.kind) {
-    case "rank-up":
-      return `⚔ Sir Peppy: Well met! Thou hast risen to ${data.rank}! (${data.xp} XP total)`;
-    case "quest-start":
-      return `⚔ Sir Peppy: A new quest begins — "${data.description}"`;
-    case "quest-resolved":
-      return `⚔ Sir Peppy: Quest resolved — "${data.description}" (+${data.xp} XP)`;
-    default:
-      return `⚔ Sir Peppy: Quest complete — "${data.description}" (+${data.xp} XP)`;
-  }
-}
+// Re-exported for convenience within pi's runtime (where pi-tui, imported above, resolves fine).
+// The test script imports directly from ../lib/progression-bar-logic.ts instead, to avoid pi-tui
+// entirely — see that file's header for why these two modules must not live under extensions/.
+export * from "../lib/progression-bar-logic.ts";
 
 // --- Wiring ---
+//
+// This extension owns one row of the status line: XP, rank, streak, and model-triggered
+// quests — see AGENTS.md's "quest lifecycle" for the step-by-step model contract. Pure
+// logic lives in ../lib/progression-bar-logic.ts; everything below is ExtensionAPI plumbing.
+//
+// Sections (registered in this order):
+//   1. Core: awardXp / updateStatus      — shared by every XP source
+//   2. Quest resolution           — resolveQuest (called by the resolve_quest tool below) + celebration renderer
+//   3. UI registrations                  — /quests widget, /xp history + its renderer
+//   4. Quest tools                — start_quest, resolve_quest: both fully model-driven,
+//                                           no automatic/mechanical trigger on either side. The
+//                                           model decides a task is quest-worthy and calls
+//                                           start_quest(title) in one step (deciding and naming
+//                                           are the same action — no separate pending/untitled
+//                                           phase, no fallback, no injected reminder); it later
+//                                           decides the task is confirmed done and calls
+//                                           resolve_quest(). No prompt text is ever inspected by
+//                                           this extension to start or end a quest.
+//   5. Session boundary                  — session_start (streak, quest reset)
+//   6. tool_result                       — quest edit-tracking, commit XP, quest-tracker XP
 
 export default function (pi: ExtensionAPI) {
   const file = xpStateFile();
   let widgetVisible = false;
-  /** The quest name shown in the status line — unset until the model titles it, or the turn ends untitled (fallback). */
+  /** The quest name shown in the status line — unset until the model starts one via start_quest. */
   let activeQuest: string | undefined;
-  /** The plain derived name for a quest that has started but has no title yet. Never shown. */
-  let pendingQuestName: string | undefined;
+  /** Edit/write tool calls seen while the current quest has been active. */
+  let questEditCount = 0;
+
+  // ===== 1. Core: awardXp / updateStatus =====
 
   function awardXp(amount: number): { state: XpState; rankChanged: boolean; rank: string } {
     const before = loadState(file);
@@ -363,14 +83,24 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus(STATUS_KEY, `⚔ ${rank} ${xpBar(state.totalXp)} · ${state.totalXp} XP${streakPart}${questPart}`);
   }
 
+  // ===== 2. Quest resolution =====
+
   function resolveQuest(ctx: ExtensionContext): void {
-    const description = activeQuest ?? pendingQuestName;
+    const description = activeQuest;
+    const edits = questEditCount;
     activeQuest = undefined;
-    pendingQuestName = undefined;
-    const { state, rankChanged, rank } = awardXp(PROMPT_QUEST_XP);
-    appendLedger({ ts: new Date().toISOString(), source: "prompt-quest", amount: PROMPT_QUEST_XP, reason: description ?? "quest" });
+    questEditCount = 0;
+    const { xp, bonus } = computeQuestPayout(edits);
+
+    if (xp === 0) {
+      updateStatus(ctx, loadState(file));
+      pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-resolved", description, xp: 0, edits: 0 });
+      return;
+    }
+    const { state, rankChanged, rank } = awardXp(xp);
+    appendLedger({ ts: new Date().toISOString(), source: "prompt-quest", amount: xp, reason: description ?? "quest" });
     updateStatus(ctx, state);
-    pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-resolved", description, xp: PROMPT_QUEST_XP });
+    pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-resolved", description, xp, edits: bonus });
     if (rankChanged) {
       pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "rank-up", rank, xp: state.totalXp });
     }
@@ -383,6 +113,8 @@ export default function (pi: ExtensionAPI) {
     }
     return box;
   });
+
+  // ===== 3. UI registrations: /quests widget, /xp history =====
 
   pi.registerCommand("quests", {
     description: "Toggle the active quest list widget",
@@ -418,72 +150,58 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ===== 4. Quest tools: start_quest, resolve_quest =====
+
+  // Fully model-driven: no automatic/mechanical start on any prompt. The model itself judges a
+  // task is quest-worthy and calls this — deciding and naming happen in the one call, no
+  // separate "pending, untitled" phase to fall back on if it's skipped. If the model never
+  // calls it, no quest exists for that turn, full stop — same trade-off already accepted for
+  // resolve_quest: judgment calls can be skipped, and that's fine, not a bug to patch around.
   pi.registerTool({
-    name: QUEST_TITLE_TOOL,
-    label: "Name Quest",
+    name: QUEST_START_TOOL,
+    label: "Start Quest",
     description:
-      "Give the current quest a short, fun, medieval-knight-flavoured title (max 40 chars) that hints at the user's task. Only call when asked to by a quest-start note.",
+      "Start a quest for the user's current task, with a short, fun, medieval-knight-flavoured title (max 40 chars) that hints at it. Call this yourself whenever you judge the task substantial enough to be worth tracking — your own judgment call, not automatic. Don't call it for simple questions or small talk.",
     parameters: Type.Object({
       title: Type.String({ description: "Playful quest title, e.g. \"Slaying the Streak Bug\"" }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const title = sanitizeQuestTitle(params.title);
-      if (!pendingQuestName || activeQuest || !title) {
-        return { content: [{ type: "text", text: "No quest to title." }], details: {} };
+      if (activeQuest || !title) {
+        return { content: [{ type: "text", text: "No quest to start." }], details: {} };
       }
       activeQuest = title;
-      pendingQuestName = undefined;
+      questEditCount = 0;
       updateStatus(ctx, loadState(file));
       pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-start", description: title, xp: 0 });
-      return { content: [{ type: "text", text: `Quest titled: ${title}` }], details: {} };
+      return { content: [{ type: "text", text: `Quest started: ${title}` }], details: {} };
     },
   });
 
-  // Fires every turn while a quest is started but not yet titled — not a one-shot flag,
-  // so a turn that errors before the model reaches the tool call still asks again next turn.
-  pi.on("before_agent_start", async () => {
-    if (!pendingQuestName || activeQuest) return;
-    return {
-      message: {
-        customType: "quest-title-request",
-        content: `A quest has begun for the user's task: "${pendingQuestName}". Call the ${QUEST_TITLE_TOOL} tool once, now, with a short, fun, knightly title (max 40 chars) themed around that specific task — not a generic quest title. Then continue the task as normal.`,
-        display: false,
-      },
-    };
-  });
-
-  pi.on("input", async (event, ctx) => {
-    if (event.source === "extension") return { action: "continue" };
-
-    if (activeQuest || pendingQuestName) {
-      // No extension-driven "is it resolved?" prompt — Sir Peppy asks that himself, per
-      // AGENTS.md, when he judges the task done. This just recognizes the user's reply.
-      if (isResolution(event.text) || isAffirmative(event.text)) resolveQuest(ctx);
-    } else {
-      const name = deriveQuestName(event.text);
-      if (name) {
-        // Held back, not shown yet: the model titles it (before_agent_start) or, failing
-        // that, agent_before_settle falls back to this name once the turn completes.
-        pendingQuestName = name;
+  // Model-driven resolution: no regex/phrase-list on the user's reply any more. The model itself
+  // calls this whenever it judges the user's words confirm the task is done — whether it asked
+  // first (per AGENTS.md's "Ask" step) or the user said so unprompted. Symmetric with
+  // start_quest: the model decides, the model calls the tool, no hidden classification pass.
+  pi.registerTool({
+    name: QUEST_RESOLVE_TOOL,
+    label: "Resolve Quest",
+    description:
+      "Resolve the current quest. Call this once you judge, from the user's own words, that the task is confirmed done — whether you asked and they confirmed, or they said so unprompted. Your own judgment call; no fixed phrase required.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      if (!activeQuest) {
+        return { content: [{ type: "text", text: "No quest to resolve." }], details: {} };
       }
-    }
-    return { action: "continue" };
+      resolveQuest(ctx);
+      return { content: [{ type: "text", text: "Quest resolved." }], details: {} };
+    },
   });
 
-  // Only job left here: fall back to the plain derived name if the model never titled the
-  // quest this turn. No more automatic "is the quest resolved?" — see AGENTS.md instead.
-  pi.on("agent_before_settle", async (event, ctx) => {
-    if (pendingQuestName && !activeQuest && event.outcome === "completed") {
-      activeQuest = pendingQuestName;
-      pendingQuestName = undefined;
-      updateStatus(ctx, loadState(file));
-      pi.appendEntry<CelebrationData>(CELEBRATION_TYPE, { kind: "quest-start", description: activeQuest, xp: 0 });
-    }
-  });
+  // ===== 5. Session boundary =====
 
   pi.on("session_start", async (_event, ctx) => {
     activeQuest = undefined;
-    pendingQuestName = undefined;
+    questEditCount = 0;
     const state = loadState(file);
     const { streak, earned } = advanceStreak(state.streak, todayUtcIso());
     let finalState = state;
@@ -499,7 +217,13 @@ export default function (pi: ExtensionAPI) {
     updateStatus(ctx, finalState);
   });
 
+  // ===== 6. tool_result: quest edit-tracking, commit XP, quest-tracker XP =====
+
   pi.on("tool_result", async (event, ctx) => {
+    if (activeQuest && isQuestEditActivity(event)) {
+      questEditCount += 1;
+    }
+
     if (isSuccessfulGitCommit(event)) {
       const { state, rankChanged, rank } = awardXp(COMMIT_XP);
       appendLedger({ ts: new Date().toISOString(), source: "commit", amount: COMMIT_XP, reason: "git commit" });
